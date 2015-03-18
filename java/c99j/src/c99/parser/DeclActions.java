@@ -1,11 +1,14 @@
 package c99.parser;
 
+import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 
 import c99.*;
 import c99.Types.*;
+import c99.parser.pp.Misc;
 import c99.parser.tree.*;
 
 import static c99.parser.Code.TYPENAME;
@@ -16,6 +19,7 @@ public class DeclActions extends ExprActions
 private static final boolean DEBUG_CALC_AGG_SIZE = false;
 private static final boolean DEBUG_ENUM = false;
 public static final boolean DEBUG_DECL = false;
+private static final boolean DEBUG_INIT = false;
 
 private Scope m_topScope;
 private Scope m_translationUnitScope;
@@ -1550,16 +1554,50 @@ public final void emptyDeclaration ( TSpecNode specNode )
   validateAndSetLinkage( tDecl );
 }
 
-public final void initDeclaration ( Decl decl )
+public final void initDeclaration ( Decl decl, InitAst.Initializer init )
 {
   if (decl.isError())
     return;
 
-  if (decl.sclass == SClass.EXTERN && !isFunc(decl.type) /*always true*/)
+  if (decl.sclass == SClass.EXTERN)
   {
-    error( decl, "'%s': 'extern' in initialization", decl.symbol );
+    error( decl, "'%s': 'extern' in initialization", optName(decl.symbol) );
     decl.orError();
     return;
+  }
+  // This check is redundant since it is covered by the previous one. Still, we want to be
+  // explicit
+  if (decl.visibilityScope.kind == Scope.Kind.BLOCK && decl.linkage != Linkage.NONE)
+  {
+    error( decl, "'%s': invalid initialization", optName(decl.symbol) );
+    decl.orError();
+    return;
+  }
+
+  // Check if the variable has a complete type. It could however be an array of unknown size.
+  // Note that if it is an array, it is already validated to have a complete element type
+  if (!decl.type.spec.isArray() && !decl.type.spec.isComplete())
+  {
+    error( decl, "variable '%s' has incomplete type '%s'", optName(decl.symbol), decl.type.readableType() );
+    decl.orError();
+    return;
+  }
+
+  final Object parsedInit = parseInitializer( decl.type, init );
+
+  // Optionally complete the array type
+  if (parsedInit != INIT_ERROR && decl.type.spec.isArray() && !((ArraySpec)decl.type.spec).hasNelem())
+  {
+    final int length;
+    if (parsedInit instanceof AnyStringConst)
+      length = ((AnyStringConst)parsedInit).length() + 1;
+    else
+      length = ((Object[])parsedInit).length;
+    ArraySpec as = (ArraySpec)decl.type.spec;
+    // Complete the array type
+    decl.type = decl.type.copy( newArraySpec( init, as.of, length ) );
+    if (DEBUG_DECL)
+      decl.storageScope.debugDecl( "complete", decl );
   }
 
   Decl prevDecl = decl.prevDecl;
@@ -1579,9 +1617,12 @@ redeclaration:
       error( decl, "'%s': invalid redefinition; already defined here: %s",
               decl.symbol.name, SourceRange.formatRange(prevDecl) );
       decl.orError();
-      break redeclaration;
+      return;
     }
   }
+
+  if (parsedInit != INIT_ERROR)
+    decl.initValue = parsedInit;
 
   if (m_topScope.kind == Scope.Kind.FILE)
   {
@@ -1595,6 +1636,236 @@ redeclaration:
     default: assert false; break;
     }
   }
+}
+
+private static final Object INIT_ERROR = Boolean.FALSE;
+
+/** check if we have a string initializer compatible with an array */
+private final boolean isArrayStringInit ( Spec spec, InitAst.Initializer elem )
+{
+  if (!spec.isArray())
+    return false;
+
+  if (!elem.isExpr())
+    return false;
+
+  final TExpr.Expr e = elem.asExpr().getExpr();
+  if (e.getCode() != TreeCode.STRING)
+    return false;
+  final TExpr.StringLiteral lit = (TExpr.StringLiteral)e;
+
+  final TypeSpec kind = ((ArraySpec)spec).of.spec.kind;
+  return kind.integer && kind.width == lit.getValue().spec.width;
+}
+
+private final Object initValue ( Qual qual, InitAst.Initializer[] elemOut )
+{
+  if (elemOut[0] == null)
+    return null;
+
+  final Spec spec = qual.spec;
+  if (spec.isScalar())
+  {
+    final Object res;
+    if (elemOut[0].isList())
+      res = initCurrentObject( qual, elemOut );
+    else
+    {
+      if (!elemOut[0].isError())
+        res = implicitTypecastExpr( qual.newUnqualified(), elemOut[0].asExpr().getExpr() );
+      else
+        res = INIT_ERROR;
+      elemOut[0] = elemOut[0].getNext();
+    }
+    return res;
+  }
+  else if (spec.isArray())
+  {
+    final ArraySpec as = (ArraySpec)spec;
+
+    if (isArrayStringInit( spec, elemOut[0] ))
+    {
+      TExpr.StringLiteral slit = (TExpr.StringLiteral)elemOut[0].asExpr().getExpr();
+      AnyStringConst value = slit.getValue();
+      if (as.hasNelem() && value.length() > as.getNelem())
+      {
+        warning( elemOut[0], "truncating character array initializer string" );
+        value = value.resize( (int) as.getNelem() );
+      }
+
+      elemOut[0] = elemOut[0].getNext();
+      return value;
+    }
+
+    final ArrayList<Object> elems = new ArrayList<Object>();
+    boolean haveError = false;
+    int index = 0;
+    while (elemOut[0] != null && (!as.hasNelem() || index < as.getNelem()))
+    {
+      final InitAst.Initializer saveElem = elemOut[0];
+      final Object v = elemOut[0].isList() ? initCurrentObject( as.of, elemOut ) : initValue( as.of, elemOut );
+      if (index == elems.size()) // fast-path for appending a new element
+        elems.add( v );
+      else if (index < elems.size())
+      {
+        if (elems.get( index ) != null)
+          warning( saveElem, "overwriting a value at index %d in array initializer", index );
+        elems.set( index, v );
+      }
+      else
+      {
+        elems.ensureCapacity( index + 1 );
+        for ( int i = elems.size(); i < index; ++i )
+          elems.add(null);
+        elems.add( v );
+      }
+
+      if (v == INIT_ERROR) // note: even if we encounter an error we continue parsing
+        haveError = true;
+      ++index;
+    }
+    return !haveError ? elems.toArray() : INIT_ERROR;
+  }
+  else if (spec.isStructUnion())
+  {
+    final StructUnionSpec sus = (StructUnionSpec)spec;
+    final Member[] susFields = sus.getFields();
+    final Member[] fields;
+    boolean haveError = false;
+    if (sus.kind == TypeSpec.STRUCT)
+      fields = susFields;
+    else
+    {
+      // Only initialize the first field in an union
+      if (sus.getFields().length > 0)
+        fields = new Member[]{ susFields[0] };
+      else
+        fields = new Member[0];
+    }
+    final Object[] resArray = new Object[susFields.length];
+    int index = 0;
+    while (elemOut[0] != null && index < fields.length)
+    {
+      final Object v = elemOut[0].isList() ?
+              initCurrentObject( fields[index].type, elemOut ) : initValue( fields[index].type, elemOut );
+      resArray[index] = v;
+      if (v == INIT_ERROR) // note: even if we encounter an error we continue parsing
+        haveError = true;
+      ++index;
+    }
+    return !haveError ? resArray : INIT_ERROR;
+  }
+  else
+  {
+    if (!elemOut[0].isError())
+      error( elemOut[0], "cannot initialize type '%s'", spec.readableType() );
+    elemOut[0] = elemOut[0].getNext();
+    return INIT_ERROR;
+  }
+}
+
+private final Object initCurrentObject ( Qual qual, InitAst.Initializer elemOut[] )
+{
+  final InitAst.InitializerList list = elemOut[0].asList();
+  elemOut[0] = elemOut[0].getNext();
+
+  final InitAst.Initializer[] elemP = new InitAst.Initializer[]{list.getFirst()};
+  final Spec spec = qual.spec;
+  Object result;
+
+  if (spec.isScalar())
+  {
+    if (elemP[0].isList())
+      warning( elemP[0], "too many braces around scalar initializer" );
+
+    result = initValue( qual, elemP );
+  }
+  else if (spec.isArray() || spec.isStructUnion())
+    result =  initValue( qual, elemP );
+  else
+  {
+    error( list, "cannot initialize type '%s'", spec.readableType() );
+    result = INIT_ERROR;
+  }
+
+  while (elemP[0] != null)
+  {
+    warning( elemP[0], "excess element in '%s' initializer", spec.readableType() );
+    elemP[0] = elemP[0].getNext();
+  }
+
+  return result;
+}
+
+/**
+ * Parse the initializer list and return a structured initializer consisting of possibly
+ * nested object[] arrays.<ul>
+ *   <li>Scalars are represented by {@link TExpr.Expr}</li>
+ *   <li>Structs, unions and arrays by object[] containing TExpr.Expr or nested object[]</li>
+ *   <li>String initializers by {@link c99.AnyStringConst}</li>
+ * </ul>
+ * In every case 'null' indicates a default value.
+ *
+ * <p>While more explicit wrapper objects
+ * for this were considered, the value they would add is minimal. </p>
+ *
+ * @param type
+ * @param init
+ * @return the parsed structured initializer or {@link #INIT_ERROR} (which is an alias for
+ *   {@link java.lang.Boolean#FALSE}) if there was any error.
+ */
+private final Object parseInitializer ( Qual type, InitAst.Initializer init )
+{
+  final InitAst.Initializer[] elemP = new InitAst.Initializer[]{ init };
+  Object result;
+
+  if (init.isList())
+    result = initCurrentObject( type, elemP );
+  else
+  {
+    if (type.spec.isScalar() || isArrayStringInit( type.spec, elemP[0] ))
+      result = initValue( type, elemP );
+    else
+    {
+      error( init, "attempting to initialize '%s' with '%s'", type.spec.readableType(),
+              init.asExpr().getExpr().getQual().spec.readableType() );
+      result = INIT_ERROR;
+    }
+  }
+
+  if (DEBUG_INIT)
+    dumpInit( new PrintWriter( System.out, true ), 0, result );
+
+  return result;
+}
+
+private final void dumpInit ( PrintWriter out, int indent, Object o )
+{
+  if (o == null)
+  {
+    MiscUtils.printIndent( indent, out );
+    out.println( "<default>" );
+  }
+  else if (o instanceof AnyStringConst)
+  {
+    MiscUtils.printIndent( indent, out );
+    out.println( Misc.simpleEscapeString( ((AnyStringConst)o).toJavaString() ) );
+  }
+  else if (o instanceof Object[])
+  {
+    Object[] a = (Object[])o;
+    MiscUtils.printIndent( indent, out );
+    out.format( "agg[%d]\n", a.length );
+    for ( Object e : a )
+      dumpInit( out, indent+4, e );
+  }
+  else if (o == INIT_ERROR)
+  {
+    MiscUtils.printIndent( indent, out );
+    out.println( "<error>" );
+  }
+  else
+    ExprFormatter.format( indent, out, (TExpr.Expr)o );
 }
 
 } // class
