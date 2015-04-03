@@ -24,6 +24,8 @@ public static abstract class Value implements ISourceRange
     return m_qual;
   }
 
+  public abstract boolean isError ();
+
   public final boolean isScalar () { return this instanceof Scalar; }
   public final Scalar asScalar () { return (Scalar)this; }
 
@@ -38,6 +40,12 @@ public static final class Scalar extends Value
   public Scalar ( Types.Qual qual )
   {
     super( qual );
+  }
+
+  @Override
+  public boolean isError ()
+  {
+    return m_value != null && m_value.isError();
   }
 
   public TExpr.Expr getValue () { return m_value; }
@@ -55,6 +63,7 @@ public static final class Aggregate extends Value
 {
   private final ArrayList<Value> m_elems;
   private final SourceRange m_sourceRange;
+  private boolean m_error;
 
   public Aggregate ( Types.Qual qual, int capacity )
   {
@@ -65,6 +74,22 @@ public static final class Aggregate extends Value
   public Aggregate ( Types.Qual qual )
   {
     this( qual, 8 );
+  }
+
+  public void setError ()
+  {
+    m_error = true;
+  }
+
+  @Override
+  public boolean isError ()
+  {
+    return m_error;
+  }
+
+  public int getLength ()
+  {
+    return m_elems.size();
   }
 
   /**
@@ -84,7 +109,9 @@ public static final class Aggregate extends Value
    */
   public void setElem ( int index, Value value )
   {
-    m_sourceRange.union( value );
+    m_error |= value.isError();
+
+//    m_sourceRange.union( value ); // FIXME
     if (index == m_elems.size())
       m_elems.add( value );
     else if (index < m_elems.size())

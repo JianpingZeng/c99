@@ -1,15 +1,13 @@
 package c99.parser;
 
 import java.io.PrintWriter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
+import java.util.*;
 
 import c99.*;
 import c99.Types.*;
 import c99.parser.pp.Misc;
 import c99.parser.tree.*;
+import org.jetbrains.annotations.NotNull;
 
 import static c99.parser.Code.TYPENAME;
 import static c99.parser.Trees.*;
@@ -19,7 +17,7 @@ public class DeclActions extends ExprActions
 private static final boolean DEBUG_CALC_AGG_SIZE = false;
 private static final boolean DEBUG_ENUM = false;
 public static final boolean DEBUG_DECL = false;
-private static final boolean DEBUG_INIT = false;
+private static final boolean DEBUG_INIT = true;
 
 private Scope m_topScope;
 private Scope m_translationUnitScope;
@@ -1583,10 +1581,11 @@ public final void initDeclaration ( Decl decl, InitAst.Initializer init )
     return;
   }
 
-  final Object parsedInit = parseInitializer( decl.type, init );
+  final TInit.Value parsedInit = parseInitializer( decl.type, init );
 
   // Optionally complete the array type
-  if (parsedInit != INIT_ERROR && decl.type.spec.isArray() && !((ArraySpec)decl.type.spec).hasNelem())
+  // FIXME: implement this
+/*  if (parsedInit != null && !parsedInit.isError() && decl.type.spec.isArray() && !((ArraySpec)decl.type.spec).hasNelem())
   {
     final int length;
     if (parsedInit instanceof AnyStringConst)
@@ -1598,7 +1597,7 @@ public final void initDeclaration ( Decl decl, InitAst.Initializer init )
     decl.type = decl.type.copy( newArraySpec( init, as.of, length ) );
     if (DEBUG_DECL)
       decl.storageScope.debugDecl( "complete", decl );
-  }
+  }*/
 
   Decl prevDecl = decl.prevDecl;
 redeclaration:
@@ -1621,8 +1620,10 @@ redeclaration:
     }
   }
 
-  if (parsedInit != INIT_ERROR)
+  if (parsedInit != null && !parsedInit.isError())
     decl.initValue = parsedInit;
+  else
+    decl.orError();
 
   if (m_topScope.kind == Scope.Kind.FILE)
   {
@@ -1637,8 +1638,6 @@ redeclaration:
     }
   }
 }
-
-private static final Object INIT_ERROR = Boolean.FALSE;
 
 /** check if we have a string initializer compatible with an array */
 private final boolean isArrayStringInit ( Spec spec, InitAst.Initializer elem )
@@ -1658,144 +1657,319 @@ private final boolean isArrayStringInit ( Spec spec, InitAst.Initializer elem )
   return kind.integer && kind.width == lit.getValue().spec.width;
 }
 
-private final Object initValue ( Qual qual, InitAst.Initializer[] elemOut )
+private final TInit.Value newInitObject ( ISourceRange loc, Qual type )
 {
-  if (elemOut[0] == null)
+  final Spec spec = type.spec;
+  final Qual unq = type.newUnqualified();
+  if (spec.isError())
     return null;
-
-  final Spec spec = qual.spec;
-  if (spec.isScalar())
+  else if (!spec.isComplete())
   {
-    final Object res;
-    if (elemOut[0].isList())
-      res = initCurrentObject( qual, elemOut );
+    error( loc, "cannot initialize incomplete type '%s'", spec.readableType() );
+    return null;
+  }
+  else if (spec.isStructUnion())
+    return new TInit.Aggregate( unq, ((StructUnionSpec)spec).getFields().length );
+  else if (spec.isArray())
+    return new TInit.Aggregate( unq );
+  else if (spec.isScalar())
+    return new TInit.Scalar( unq );
+  else
+  {
+    error( loc, "cannot initialize type '%s'", spec.readableType() );
+    return null;
+  }
+}
+
+private static enum InitResult
+{
+  OK,
+  DESIGNATOR_SELECT,
+  ERROR
+}
+
+@NotNull
+private final InitResult resolveDesignator (
+  @NotNull TInit.Value lookupObj, InitAst.Initializer[] elem, InitAst.Designator designator
+)
+{
+  if (designator.isError())
+    return InitResult.ERROR;
+
+  if (designator instanceof InitAst.FieldDesignator)
+  {
+    final InitAst.FieldDesignator fd = (InitAst.FieldDesignator)designator;
+    if (lookupObj.getQual().spec.isStructUnion())
+    {
+      final StructUnionSpec spec = (StructUnionSpec)lookupObj.getQual().spec;
+      final TInit.Aggregate agg = lookupObj.asAggregate();
+      final Member member = spec.lookupMember( fd.ident );
+      if (member != null)
+      {
+        if ( (lookupObj = agg.getElem( member.index )) == null)
+        {
+          if ((lookupObj = newInitObject( designator, member.type )) == null)
+            return InitResult.ERROR;
+          agg.setElem( member.index, lookupObj );
+        }
+        else if (designator.getNext() == null)
+          warning( designator, "overwriting field '.%s' of '%s'", optName( fd.ident ), spec.readableType() );
+      }
+      else
+      {
+        error( designator, "field '.%s' is not a member of '%s'", optName( fd.ident ), spec.readableType() );
+        return InitResult.ERROR;
+      }
+    }
     else
     {
-      if (!elemOut[0].isError())
-        res = implicitTypecastExpr( qual.newUnqualified(), elemOut[0].asExpr().getExpr() );
-      else
-        res = INIT_ERROR;
-      elemOut[0] = elemOut[0].getNext();
+      error( designator, "field designator in initializer for type '%s'", lookupObj.getQual().spec.readableType() );
+      return InitResult.ERROR;
     }
-    return res;
   }
-  else if (spec.isArray())
+  else if (designator instanceof InitAst.IndexDesignator)
   {
-    final ArraySpec as = (ArraySpec)spec;
-
-    if (isArrayStringInit( spec, elemOut[0] ))
+    final InitAst.IndexDesignator id = (InitAst.IndexDesignator)designator;
+    if (lookupObj.getQual().spec.isArray())
     {
-      TExpr.StringLiteral slit = (TExpr.StringLiteral)elemOut[0].asExpr().getExpr();
-      AnyStringConst value = slit.getValue();
-      if (as.hasNelem() && value.length() > as.getNelem())
-      {
-        warning( elemOut[0], "truncating character array initializer string" );
-        value = value.resize( (int) as.getNelem() );
-      }
+      final ArraySpec spec = (ArraySpec)lookupObj.getQual().spec;
+      final TInit.Aggregate agg = lookupObj.asAggregate();
 
-      elemOut[0] = elemOut[0].getNext();
-      return value;
-    }
-
-    final ArrayList<Object> elems = new ArrayList<Object>();
-    boolean haveError = false;
-    int index = 0;
-    while (elemOut[0] != null && (!as.hasNelem() || index < as.getNelem()))
-    {
-      final InitAst.Initializer saveElem = elemOut[0];
-      final Object v = elemOut[0].isList() ? initCurrentObject( as.of, elemOut ) : initValue( as.of, elemOut );
-      if (index == elems.size()) // fast-path for appending a new element
-        elems.add( v );
-      else if (index < elems.size())
+      if (!spec.hasNelem() || spec.getNelem() > id.index)
       {
-        if (elems.get( index ) != null)
-          warning( saveElem, "overwriting a value at index %d in array initializer", index );
-        elems.set( index, v );
+        if ( (lookupObj = agg.getElem( id.index )) == null)
+        {
+          if ((lookupObj = newInitObject( designator, spec.of )) == null)
+            return InitResult.ERROR;
+          agg.setElem( id.index, lookupObj );
+        }
+        else if (designator.getNext() == null)
+          warning( designator, "overwriting array index (%d)", id.index );
       }
       else
       {
-        elems.ensureCapacity( index + 1 );
-        for ( int i = elems.size(); i < index; ++i )
-          elems.add(null);
-        elems.add( v );
+        error( designator, "array designator index (%d) exceeds array bounds (%d)", id.index, spec.getNelem() );
+        return InitResult.ERROR;
       }
-
-      if (v == INIT_ERROR) // note: even if we encounter an error we continue parsing
-        haveError = true;
-      ++index;
     }
-    return !haveError ? elems.toArray() : INIT_ERROR;
+    else
+    {
+      error( designator, "index designator in initializer for type '%s'", lookupObj.getQual().spec.readableType() );
+      return InitResult.ERROR;
+    }
   }
+  else if (designator instanceof InitAst.RangeDesignator)
+  {
+    final InitAst.RangeDesignator id = (InitAst.RangeDesignator)designator;
+    if (lookupObj.getQual().spec.isArray())
+    {
+      final ArraySpec spec = (ArraySpec)lookupObj.getQual().spec;
+      final TInit.Aggregate agg = lookupObj.asAggregate();
+
+      if (!spec.hasNelem() || spec.getNelem() > id.first && spec.getNelem() > id.last)
+      {
+        InitResult initRes;
+        InitAst.Initializer saveElem = elem[0];
+
+        for ( int i = id.first;; ) // Have to code the iteration carefully to avoid overflow
+        {
+          if ( (lookupObj = agg.getElem( i )) == null)
+          {
+            if ((lookupObj = newInitObject( designator, spec.of )) == null)
+              return InitResult.ERROR;
+            agg.setElem( i, lookupObj );
+          }
+          else if (designator.getNext() == null)
+            warning( designator, "overwriting array index (%d)", i );
+
+          elem[0] = saveElem;
+          if ( (initRes = initValues( lookupObj, elem, designator.getNext() )) == InitResult.ERROR)
+            return InitResult.ERROR;
+
+          // Careful to check the exit condition before incrementing, as id.last could be INT_MAX
+          if (i == id.last)
+            break;
+          ++i;
+        }
+
+        return initRes;
+      }
+      else
+      {
+        error( designator, "array designator index (%d) exceeds array bounds (%d)",
+                Math.max(id.first, id.last), spec.getNelem() );
+        return InitResult.ERROR;
+      }
+    }
+    else
+    {
+      error( designator, "range designator in initializer for type '%s'", lookupObj.getQual().spec.readableType() );
+      return InitResult.ERROR;
+    }
+  }
+  else
+    assert false : "Unknown designator type " + designator.getClass().getName();
+
+  // TODO: avoid the indirect recursion (resolveDesignator->initValues->resolveDesignator)
+  return initValues( lookupObj, elem, designator.getNext() );
+}
+
+@NotNull
+private final InitResult initValuesOrList ( @NotNull TInit.Value obj, InitAst.Initializer[] elemOut )
+{
+  InitResult r;
+  if (!elemOut[0].isList())
+    r = initValues( obj, elemOut, null );
+  else
+  {
+    r = selectCurObject( obj, elemOut[0].asList() );
+    elemOut[0] = elemOut[0].getNext();
+  }
+  return r;
+}
+
+@NotNull
+private final InitResult initValues ( @NotNull TInit.Value obj, InitAst.Initializer[] elemOut, InitAst.Designator designator )
+{
+  InitResult r;
+  if (designator != null)
+    if ( (r = resolveDesignator( obj, elemOut, designator )) != InitResult.OK)
+      return r;
+
+  if (elemOut[0] == null)
+    return InitResult.OK;
+
+  if (elemOut[0].isError())
+    return InitResult.ERROR;
+
+  final Spec spec = obj.getQual().spec;
+  if (spec.isScalar())
+  {
+    if (!elemOut[0].isList())
+    {
+      obj.asScalar().setValue( implicitTypecastExpr( obj.getQual(), elemOut[0].asExpr().getExpr() ) );
+      r = InitResult.OK;
+    }
+    else
+      r = selectCurObject( obj, elemOut[0].asList() );
+
+    elemOut[0] = elemOut[0].getNext();
+    return r;
+  }
+//  else if (spec.isArray())
+//  {
+//    final ArraySpec as = (ArraySpec)spec;
+//
+////    if (isArrayStringInit( spec, elemOut[0] ))
+////    {
+////      TExpr.StringLiteral slit = (TExpr.StringLiteral)elemOut[0].asExpr().getExpr();
+////      AnyStringConst value = slit.getValue();
+////      if (as.hasNelem() && value.length() > as.getNelem())
+////      {
+////        warning( elemOut[0], "truncating character array initializer string" );
+////        value = value.resize( (int) as.getNelem() );
+////      }
+////
+////      elemOut[0] = elemOut[0].getNext();
+////      return value;
+////    }
+//
+//    boolean haveError = false;
+//    int index = 0;
+//    while (elem != null && (!as.hasNelem() || index < as.getNelem()))
+//    {
+//      final InitAst.Initializer saveElem = elem;
+//      final Object v = elemOut[0].isList() ? initCurrentObject( as.of, elemOut ) : initValue( as.of, elemOut );
+//      if (index == elems.size()) // fast-path for appending a new element
+//        elems.add( v );
+//      else if (index < elems.size())
+//      {
+//        if (elems.get( index ) != null)
+//          warning( saveElem, "overwriting a value at index %d in array initializer", index );
+//        elems.set( index, v );
+//      }
+//      else
+//      {
+//        elems.ensureCapacity( index + 1 );
+//        for ( int i = elems.size(); i < index; ++i )
+//          elems.add(null);
+//        elems.add( v );
+//      }
+//
+//      if (v == INIT_ERROR) // note: even if we encounter an error we continue parsing
+//        haveError = true;
+//      ++index;
+//    }
+//    return !haveError ? elems.toArray() : INIT_ERROR;
+//  }
   else if (spec.isStructUnion())
   {
     final StructUnionSpec sus = (StructUnionSpec)spec;
-    final Member[] susFields = sus.getFields();
-    final Member[] fields;
-    boolean haveError = false;
-    if (sus.kind == TypeSpec.STRUCT)
-      fields = susFields;
-    else
-    {
-      // Only initialize the first field in an union
-      if (sus.getFields().length > 0)
-        fields = new Member[]{ susFields[0] };
-      else
-        fields = new Member[0];
-    }
-    final Object[] resArray = new Object[susFields.length];
+    final TInit.Aggregate agg = obj.asAggregate();
+    final Member[] fields = sus.getFields();
+    final int fieldCount = sus.kind == TypeSpec.STRUCT ? fields.length : Math.min( 1, fields.length );
+
     int index = 0;
-    while (elemOut[0] != null && index < fields.length)
+    while (elemOut[0] != null && index < fieldCount)
     {
-      final Object v = elemOut[0].isList() ?
-              initCurrentObject( fields[index].type, elemOut ) : initValue( fields[index].type, elemOut );
-      resArray[index] = v;
-      if (v == INIT_ERROR) // note: even if we encounter an error we continue parsing
-        haveError = true;
+      if (elemOut[0].getDesignation() != null)
+        return InitResult.DESIGNATOR_SELECT;
+
+      TInit.Value valObj;
+      if ((valObj = agg.getElem( index )) == null)
+      {
+        if ((valObj = newInitObject( elemOut[0], fields[index].type )) == null)
+          return InitResult.ERROR;
+        agg.setElem( index, valObj );
+      }
+      else
+        warning( designator, "overwriting field '.%s' of '%s'", optName( fields[index].name ), fields[index].type.readableType() );
+
+      if ( (r = initValuesOrList( valObj, elemOut )) != InitResult.OK)
+        return r;
+
       ++index;
     }
-    return !haveError ? resArray : INIT_ERROR;
+    return InitResult.OK;
   }
   else
   {
-    if (!elemOut[0].isError())
-      error( elemOut[0], "cannot initialize type '%s'", spec.readableType() );
-    elemOut[0] = elemOut[0].getNext();
-    return INIT_ERROR;
+    assert false;
+    return InitResult.ERROR;
   }
 }
 
-private final Object initCurrentObject ( Qual qual, InitAst.Initializer elemOut[] )
+private final InitResult selectCurObject ( TInit.Value obj, InitAst.InitializerList list )
 {
-  final InitAst.InitializerList list = elemOut[0].asList();
-  elemOut[0] = elemOut[0].getNext();
+  if (list.isError())
+    return InitResult.ERROR;
 
-  final InitAst.Initializer[] elemP = new InitAst.Initializer[]{list.getFirst()};
-  final Spec spec = qual.spec;
-  Object result;
+  InitAst.Initializer elem = list.getFirst();
 
-  if (spec.isScalar())
+  if (elem == null) // an empty list? Our work here is done
+    return InitResult.OK;
+
+  if (obj.isScalar() && elem.isList())
+    warning( elem, "too many braces around scalar initializer" );
+
+  InitResult r;
+  InitAst.Initializer[] elemOut = new InitAst.Initializer[]{ elem };
+  do
+    r = initValues( obj, elemOut, elemOut[0].getDesignation() );
+  while (r == InitResult.DESIGNATOR_SELECT);
+
+  if (r == InitResult.ERROR)
+    return r;
+
+  while (elemOut[0] != null)
   {
-    if (elemP[0].isList())
-      warning( elemP[0], "too many braces around scalar initializer" );
-
-    result = initValue( qual, elemP );
-  }
-  else if (spec.isArray() || spec.isStructUnion())
-    result =  initValue( qual, elemP );
-  else
-  {
-    error( list, "cannot initialize type '%s'", spec.readableType() );
-    result = INIT_ERROR;
-  }
-
-  while (elemP[0] != null)
-  {
-    warning( elemP[0], "excess element in '%s' initializer", spec.readableType() );
-    elemP[0] = elemP[0].getNext();
+    warning( elemOut[0], "excess element in '%s' initializer", obj.getQual().readableType() );
+    elemOut[0] = elemOut[0].getNext();
   }
 
-  return result;
+  return InitResult.OK;
 }
+
 
 /**
  * Parse the initializer list and return a structured initializer consisting of possibly
@@ -1811,61 +1985,37 @@ private final Object initCurrentObject ( Qual qual, InitAst.Initializer elemOut[
  *
  * @param type
  * @param init
- * @return the parsed structured initializer or {@link #INIT_ERROR} (which is an alias for
+ * @return the parsed structured initializer or (which is an alias for
  *   {@link java.lang.Boolean#FALSE}) if there was any error.
  */
-private final Object parseInitializer ( Qual type, InitAst.Initializer init )
+private final TInit.Value parseInitializer ( Qual type, InitAst.Initializer init )
 {
-  final InitAst.Initializer[] elemP = new InitAst.Initializer[]{ init };
-  Object result;
+  TInit.Value obj;
+
+  if ( (obj = newInitObject( init, type )) == null)
+    return null;
+
+  InitResult r;
 
   if (init.isList())
-    result = initCurrentObject( type, elemP );
+    r = selectCurObject( obj, init.asList() );
   else
   {
+    final InitAst.Initializer[] elemP = new InitAst.Initializer[]{ init };
     if (type.spec.isScalar() || isArrayStringInit( type.spec, elemP[0] ))
-      result = initValue( type, elemP );
+      r = initValues( obj, elemP, elemP[0].getDesignation() );
     else
     {
       error( init, "attempting to initialize '%s' with '%s'", type.spec.readableType(),
               init.asExpr().getExpr().getQual().spec.readableType() );
-      result = INIT_ERROR;
+      r = InitResult.ERROR;
     }
   }
 
   if (DEBUG_INIT)
-    dumpInit( new PrintWriter( System.out, true ), 0, result );
+    ExprFormatter.format( 0, new PrintWriter( System.out, true ), obj );
 
-  return result;
-}
-
-private final void dumpInit ( PrintWriter out, int indent, Object o )
-{
-  if (o == null)
-  {
-    MiscUtils.printIndent( indent, out );
-    out.println( "<default>" );
-  }
-  else if (o instanceof AnyStringConst)
-  {
-    MiscUtils.printIndent( indent, out );
-    out.println( Misc.simpleEscapeString( ((AnyStringConst)o).toJavaString() ) );
-  }
-  else if (o instanceof Object[])
-  {
-    Object[] a = (Object[])o;
-    MiscUtils.printIndent( indent, out );
-    out.format( "agg[%d]\n", a.length );
-    for ( Object e : a )
-      dumpInit( out, indent+4, e );
-  }
-  else if (o == INIT_ERROR)
-  {
-    MiscUtils.printIndent( indent, out );
-    out.println( "<error>" );
-  }
-  else
-    ExprFormatter.format( indent, out, (TExpr.Expr)o );
+  return r == InitResult.OK ? obj : null;
 }
 
 } // class
